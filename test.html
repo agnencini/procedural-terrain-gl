@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html>
+
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+		<title>CG&3D - Procedural Terrain</title>
+	</head>
+	
+	<body>
+	
+		<script src="three.js/build/three.js"></script>
+		<script src="three.js/examples/js/controls/FlyControls.js"></script>
+		<script src="three.js/examples/js/loaders/OBJLoader.js"></script>
+		<script src="three.js/examples/js/loaders/MTLLoader.js"></script>
+		
+		<script src="three.js/examples/js/postprocessing/EffectComposer.js"></script>
+		<script src="three.js/examples/js/postprocessing/SMAAPass.js"></script>
+		<script src="three.js/examples/js/postprocessing/RenderPass.js"></script>
+		<script src="three.js/examples/js/postprocessing/MaskPass.js"></script>
+		<script src="three.js/examples/js/postprocessing/ShaderPass.js"></script>
+		<script src="three.js/examples/js/shaders/CopyShader.js"></script>
+		<script src="three.js/examples/js/shaders/SMAAShader.js"></script>	
+		<script src="three.js/examples/js/shaders/SSAOShader.js"></script>
+		
+		<script src="three.js/examples/js/libs/stats.min.js"></script>
+		<script src="three.js/examples/js/libs/dat.gui.min.js"></script>
+		<script src="lib/perlin.js"></script>	
+		
+		<script src="terrain.js"></script>	
+		<script src="loaders.js"></script>	
+		
+		
+		<!-- Vertex shader of the skyDome -->
+		<script type="application/x-glsl" id="sky-vertex">  
+		
+			varying vec2 vUV; // UV mapping coordinates
+
+			void main() 
+			{  
+				vUV = uv;
+				vec4 pos = vec4(position, 1.0);
+				gl_Position = projectionMatrix * modelViewMatrix * pos;
+			}
+		</script>
+
+		
+		<!-- Fragment shader of the skyDome -->
+		<script type="application/x-glsl" id="sky-fragment"> 
+		
+			uniform sampler2D texture;  
+			uniform sampler2D sunTexture;
+			varying vec2 vUV;
+
+			// Map the sky texture on the sphere
+			void main() 
+			{  
+				vec4 t0 = texture2D(texture, vUV);
+				vec4 t1 = texture2D(sunTexture, vUV);
+				gl_FragColor = (1.0 - t1.a) * t0 + t1.a * t1;
+			}
+		</script>  
+
+		
+		<script>
+			var scene; 		// Main scene
+			var camera;		// Main camera
+			var controls;	// Camera controls
+			var renderer;	// Renderer
+			var composer;	// Composer for postprocessing
+			var clock;		// Clock for time deltas
+			var stats;		// Performance info
+			
+			/* 3D OBJECTS */
+			var skyDome; 		// Skydome mesh
+			var sun;   			// Directional Light
+			var grid = []; 		// Grid of terrain tiles
+			var trees = [];		// Tree meshes
+			var yurts = [];		// Yurt meshes
+					
+			/* OBJECTS PARAMETERS */ 
+			var blockSize = 4096; 				// Terrain tile side size 						NOTE: increasing this too much will reduce terrain detail
+			var blockDensity = 256;				// Number of vertices per side of tile 			WARNING: increasing this will cause performance issues
+			var heightMultiplier = 0.75;		// Scale the noise-generated height values 		NOTE: increase to have higher mountains, reduce to flat terrain
+			var skyDomeDistance = 5200;			// Sky distance from camera 					NOTE: normally it should be a bit less than viewDistance
+			var viewDistance = 7400;			// Maximum rendering distance 					NOTE: to effectively hide tile translations this value should be less than 1.5 * blockSize
+			var fogNear = 4000, fogFar = 6000;	// Minimum and maximum fog rendering distance 	NOTE: fogNear should be less than viewDistance, fogFar a little bit more
+			
+			var numTrees = 100;	// Number of trees on the scene 	WARNING: increasing this too much will cause performance issues
+			var numYurts = 15;	// Number of yurts on the scene		WARNING: increasing this too much will cause performance issues
+			
+			var fogColor = 0x8f8b88;			// Fog color
+			var ambientLightColor = 0xffffff;	// Ambient light color
+			var ambientLightIntensity = 0.4;	// Ambient light intensity
+			var sunColor = 0xffffff;			// Directional light color
+			
+			/* POSTPROCESSING PARAMETERS */
+			var postprocessingOptions = {Postprocessing : true};
+			
+			var copy;											// Copy of terrain data for flipping
+			var heightMap;										// Heightmap data
+			var groundTexture = 'textures/terrain/ground.jpg';	// Ground texture image path
+			var groundBump = 'textures/bump_map/bump.jpg';		// Ground bump map image path
+			var prevX = 0;										// Previous update camera position X
+			var prevZ = 0;										// Previous update camera position Z
+			
+			init();
+			animate();
+		
+			function init()
+			{
+				container = document.createElement('div');
+				document.body.appendChild(container);
+			
+				clock = new THREE.Clock();
+				scene = new THREE.Scene();
+				
+				camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 1, viewDistance);
+				camera.position.x = 0;
+				camera.position.y = 400;
+				camera.position.z = 0;
+				
+				// Add ambient light and fog to the scene
+				scene.fog = new THREE.FogExp2(fogColor, 0.0005);
+				scene.add(new THREE.AmbientLight(ambientLightColor, ambientLightIntensity));
+				
+				// Add directional light to emulate sun
+				sun = new THREE.DirectionalLight(sunColor, 1);
+				sun.castShadow = true;
+				sun.shadowCameraNear = true;
+				
+				sun.position.x = -10000;
+				sun.position.y = camera.position.y + 9800;
+				sun.position.z = -10000;
+
+				sun.target.position.set(camera.position.x, camera.position.y - 400, camera.position.z);
+				sun.shadow.camera.far = 50000;
+				sun.shadowCameraLeft = -4000;
+                sun.shadowCameraRight = 4000;
+                sun.shadowCameraTop = 4000;
+                sun.shadowCameraBottom = -4000;
+				
+				scene.add(sun.target);
+				scene.add(sun);
+				
+				// Create terrain tiles
+				createTiles(grid, blockSize, blockDensity, groundTexture, groundBump);
+				
+				// Create the skydome
+				var skySphere = new THREE.SphereGeometry(skyDomeDistance, 64, 64);  
+				var uniforms = {texture: { type: 't', value: THREE.ImageUtils.loadTexture('textures/skydome/skydome.jpg')}, 
+								sunTexture: { type: 't', value: THREE.ImageUtils.loadTexture('textures/skydome/sun.png')}};
+
+				var material = new THREE.ShaderMaterial(
+				{  
+					uniforms:       uniforms,
+					vertexShader:   document.getElementById('sky-vertex').textContent,
+					fragmentShader: document.getElementById('sky-fragment').textContent
+				});
+				
+				skyDome = new THREE.Mesh(skySphere, material);  
+				skyDome.scale.set(-1, 1, 1);  
+				skyDome.eulerOrder = 'XZY';  
+				skyDome.renderDepth = 1000.0;  
+				scene.add(skyDome);  
+				
+				// Create random-placed trees (see loaders.js)
+				loadTrees(numTrees, trees, scene);
+				// Create random-placed yurts (see loaders.js)
+				loadYurts(numYurts, yurts, scene);
+				
+				// Camera controls settings (forward automatic move, Q/E to roll the camera, S to move backward, arrows or mouse to point)
+				controls = new THREE.FlyControls(camera);
+				controls.movementSpeed = 256;
+				controls.rollSpeed = Math.PI / 6;
+				controls.autoForward = true;
+				controls.dragToLook = false;
+				
+				// Create renderer
+				renderer = new THREE.WebGLRenderer({antialias : false});
+				renderer.setPixelRatio(window.devicePixelRatio);
+				renderer.setSize(window.innerWidth, window.innerHeight);
+				container.appendChild(renderer.domElement);
+				renderer.autoClear = false;
+				renderer.alpha = true;
+				renderer.shadowMap.enabled = true;
+				renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+				
+				// Create composer (post processor)
+				composer = new THREE.EffectComposer(renderer);
+				composer.addPass(new THREE.RenderPass(scene, camera));
+				
+				// Add sub-pixel morphological AA
+				var smaaPass = new THREE.SMAAPass(window.innerWidth, window.innerHeight);
+				smaaPass.renderToScreen = false;
+				composer.addPass(smaaPass);
+				
+				// Add screen space Ambient Occlusion
+				var depthMaterial = new THREE.MeshDepthMaterial();
+				depthMaterial.depthPacking = THREE.RGBADepthPacking;
+				depthMaterial.blending = THREE.NoBlending;
+				var parameters = {minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter};
+				var depthRenderTarget = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, parameters);
+				depthRenderTarget.texture.name = "SSAOShader.rt";
+
+				var ssaoPass = new THREE.ShaderPass(THREE.SSAOShader);
+				ssaoPass.renderToScreen = true;
+				ssaoPass.uniforms['tDepth'].value = depthRenderTarget.texture;
+				ssaoPass.uniforms['size'].value.set(window.innerWidth, window.innerHeight);
+				ssaoPass.uniforms['cameraNear'].value = camera.near;
+				ssaoPass.uniforms['cameraFar'].value = camera.far;
+				ssaoPass.uniforms['onlyAO'].value = false;
+				ssaoPass.uniforms['aoClamp'].value = 0.3;
+				ssaoPass.uniforms['lumInfluence'].value = 0.5;
+				composer.addPass(ssaoPass);
+
+				// Performance stats
+				stats = new Stats();
+				container.appendChild(stats.dom);
+				
+				// GUI controls
+				var gui = new dat.GUI();
+				gui.add(postprocessingOptions, "Postprocessing").onChange();
+				
+				// Update camera aspect and projection matrix when the window is resized
+				window.addEventListener('resize', function (event)
+				{
+					renderer.setSize(window.innerWidth, window.innerHeight);
+					composer.setSize(window.innerWidth, window.innerHeight);
+					camera.aspect = window.innerWidth / window.innerHeight;
+					camera.updateProjectionMatrix();
+				}, false);
+			}
+
+			function animate() 
+			{		
+				requestAnimationFrame(animate);	
+				stats.begin();
+				
+				// Update objects' position
+				updatePosition(grid);
+				updatePosition(trees);
+				updatePosition(yurts);
+				
+				// Move skydome with camera
+				skyDome.position.set(camera.position.x, 0, camera.position.z);
+				
+				// Prevent camera to move under the terrain
+				var tileY = getTilePointHeight(camera.position.x, camera.position.z);
+				if(camera.position.y < tileY + 10)
+					camera.position.set(camera.position.x, tileY + 10, camera.position.z);
+
+				// Update sun position
+				if(Math.abs(camera.position.x - prevX) > 2500 || Math.abs(camera.position.z - prevZ) > 2500)
+				{
+					sun.position.x = camera.position.x - 10000;
+					sun.position.y = camera.position.y + 9800;
+					sun.position.z = camera.position.z - 10000;
+					
+					sun.target.position.set(camera.position.x, camera.position.y - 400, camera.position.z);
+				    prevX = camera.position.x;
+				    prevZ = camera.position.z;
+			    }
+				
+				var delta = clock.getDelta();
+				controls.update(delta);
+				
+				if(postprocessingOptions.Postprocessing)
+					composer.render();
+				else
+					renderer.render(scene, camera);
+				
+				stats.end();
+			}
+			
+			/**
+				Update the position of a list of objects to create the illusion of unlimited space.
+				
+				@param
+					objects	an array of THREE.Object3D meshes.
+			*/
+			function updatePosition(objects)
+			{
+				for(var i = 0; i < objects.length; i++)
+				{
+					// Distances along X and Z axis between the current object and the camera
+					var diffz = objects[i].position.z - camera.position.z;
+					var diffx = objects[i].position.x - camera.position.x;
+					
+					// If the object is far from the camera along an axis, translate it "forward"
+					if(diffz > 2 * blockSize)
+						objects[i].position.set(objects[i].position.x, objects[i].position.y, objects[i].position.z - blockSize * 4);
+					else if(diffz < - 2 * blockSize)
+						objects[i].position.set(objects[i].position.x, objects[i].position.y, objects[i].position.z + blockSize * 4);
+					else if(diffx > 2 * blockSize)
+						objects[i].position.set(objects[i].position.x - blockSize * 4, objects[i].position.y, objects[i].position.z);
+					else if(diffx < -2 * blockSize)
+						objects[i].position.set(objects[i].position.x + blockSize * 4, objects[i].position.y, objects[i].position.z);
+				}
+			}
+			
+			/**
+				Get the height of a (X, Z) point using ray casting relatively to the terrain.
+				A ray is fired along the vertical of the point (X, 0, Z). The distance travelled 
+				until the collision is equal to the height of the terrain on that specific point.
+				
+				@param
+					x	point X coordinate.
+					z	point Z coordinate.
+				
+				@return	the altitude of the point (X, Z).
+			*/
+			function getTilePointHeight(x, z)
+			{
+				var vertex = new THREE.Vector3(x, 0, z);
+				var vertical = new THREE.Vector3(0, 1, 0);
+				var ray = new THREE.Raycaster(vertex, vertical);
+				
+				for(var i = 0; i < grid.length; i++)
+				{
+					var collision = ray.intersectObject(grid[i], true);
+					// If a collision happened, return the Y coordinate of the collided point
+					if(collision.length > 0)
+						return collision[0].point.y;
+				}
+				return 0;
+			}
+			
+		</script>
+   </body>
+   
+</html>
